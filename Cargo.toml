@@ -1,0 +1,8 @@
+[package]
+name = "AhoCorasick"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+lazy_static = { version = "1.5.0", features = ["spin_no_std"] }
+indicatif = "0.15.0"
