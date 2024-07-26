@@ -5,10 +5,8 @@ This project implements a word search and matching system that identifies occurr
 ## Table of Contents
 
 - [Getting Started](#getting-started)
-- [Usage](#usage)
 - [Code Explanation](#code-explanation)
 - [Requirements](#requirements)
-- [Contributors](#contributors)
 - [License](#license)
 
 ## Getting Started
