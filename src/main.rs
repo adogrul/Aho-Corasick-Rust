@@ -1,243 +1,215 @@
-use lazy_static::lazy_static;
-use std::collections::{HashMap, VecDeque};
-use std::fs;
-use std::fs::File;
-use std::io::{self, Read, BufRead};
-use std::sync::Mutex;
+use std::ffi::CString;
+use std::fs::{self, File};
+use std::io::{self, BufRead, BufReader, Error, Read};
+use std::ptr::null_mut;
 use std::time::Instant;
-use indicatif::ProgressBar;
+use indicatif::{ProgressBar, ProgressStyle};
+use winapi::um::fileapi::{CreateFileA, OPEN_EXISTING};
+use winapi::um::handleapi::{CloseHandle, INVALID_HANDLE_VALUE};
+use winapi::um::memoryapi::{CreateFileMappingW, MapViewOfFile, UnmapViewOfFile, FILE_MAP_READ};
+use winapi::um::winnt::{GENERIC_READ, HANDLE, IMAGE_DOS_HEADER, IMAGE_NT_HEADERS64, IMAGE_DOS_SIGNATURE, IMAGE_NT_SIGNATURE, PAGE_READONLY, IMAGE_FILE_MACHINE_I386, IMAGE_FILE_MACHINE_AMD64};
 
-const MAXS: usize = 100000;
-const MAXC: usize = 128;
-const BIT_WIDTH: usize = std::mem::size_of::<usize>() * 8;
+const D: u64 = 256;
 
-lazy_static! {
-    static ref CHAR_TO_INDEX: HashMap<char, usize> = {
-        let mut m = HashMap::new();
-        for i in 0..MAXC {
-            m.insert(i as u8 as char, i);
+fn rk_search(pat: &str, txt: &[u8], q: u64) {
+    let m = pat.len();
+    let n = txt.len();
+    let mut p = 0; // hash value for pattern
+    let mut t = 0; // hash value for text
+    let mut h = 1;
+
+    // The value of h would be "pow(d, M-1)%q"
+    for _ in 0..m-1 {
+        h = (h * D) % q;
+    }
+
+    // Calculate the hash value of pattern and first window of text
+    for i in 0..m {
+        p = (D * p + pat.as_bytes()[i] as u64) % q;
+        t = (D * t + txt[i] as u64) % q;
+    }
+
+    // Slide the pattern over text one by one
+    for i in 0..=(n - m) {
+        if p == t {
+            // Check for characters one by one
+            let mut j = 0;
+            while j < m && txt[(i + j) as usize] == pat.as_bytes()[j] {
+                j += 1;
+            }
+
+            // if p == t and pat[0...M-1] = txt[i, i+1, ... i+M-1]
+            if j == m {
+                println!("Pattern found at index {}", i);
+            }
         }
-        m
-    };
-    static ref OUT: Mutex<HashMap<usize, Vec<usize>>> = Mutex::new(HashMap::new());
-    static ref F: Mutex<Vec<isize>> = Mutex::new(vec![-1; MAXS]);
-    static ref G: Mutex<Vec<Vec<isize>>> = Mutex::new(vec![vec![-1; MAXC]; MAXS]);
+
+        // Calculate hash value for next window of text:
+        // Remove leading digit, add trailing digit
+        if i < n - m {
+            let txt_i = txt[i as usize] as u64;
+            let txt_i_m = txt[(i + m) as usize] as u64;
+            
+            // Ensure that t - txt_i * h does not overflow
+            let new_t = (D * (t + q - (txt_i * h) % q) + txt_i_m) % q;
+
+            // Update t
+            t = new_t;
+        }
+    }
 }
 
-fn get_file_size(path: &str) -> io::Result<u64> {
-    let metadata = fs::metadata(path)?;
-    Ok(metadata.len())
-}
-
-fn read_all_bytes(path: &str) -> io::Result<Vec<u8>> {
+fn read_all_bytes(path: &str) -> Result<Vec<u8>, Error> {
     let mut file = File::open(path)?;
-    let size = get_file_size(path)? as usize;
-    let mut buffer = vec![0; size];
-    file.read_exact(&mut buffer)?;
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer)?;
     Ok(buffer)
 }
 
-fn build_matching_machine(arr: &[String], k: usize) {
-    let mut states = 1;
-
-    let mut out = OUT.lock().unwrap();
-    let mut f = F.lock().unwrap();
-    let mut g = G.lock().unwrap();
-
-    for (word_idx, word) in arr.iter().enumerate().take(k) {
-        let mut current_state = 0;
-
-        for c in word.chars() {
-            let ch = *CHAR_TO_INDEX.get(&c).unwrap_or(&0);
-
-            if g[current_state][ch] == -1 {
-                if states >= MAXS {
-                    panic!("Durum sayısı MAXS sınırını aştı");
-                }
-                g[current_state][ch] = states as isize;
-                states += 1;
-            }
-
-            current_state = g[current_state][ch] as usize;
-        }
-
-        let entry = out.entry(current_state).or_insert_with(|| vec![0; (k + BIT_WIDTH - 1) / BIT_WIDTH]);
-        if word_idx >= entry.len() * BIT_WIDTH {
-            panic!("word_idx dizininin boyutunu aştı");
-        }
-        entry[word_idx / BIT_WIDTH] |= 1 << (word_idx % BIT_WIDTH);
-    }
-
-    for ch in 0..MAXC {
-        if g[0][ch] == -1 {
-            g[0][ch] = 0;
-        }
-    }
-
-    let mut q = VecDeque::new();
-
-    for ch in 0..MAXC {
-        if g[0][ch] != 0 {
-            f[g[0][ch] as usize] = 0;
-            q.push_back(g[0][ch] as usize);
-        }
-    }
-
-    while let Some(state) = q.pop_front() {
-        for ch in 0..MAXC {
-            if g[state][ch] != -1 {
-                let mut failure = f[state] as usize;
-                while g[failure][ch] == -1 {
-                    if failure == 0 {
-                        break;  // Eğer failure zaten 0 ise, daha fazla azaltma yapamayız.
-                    }
-                    failure = f[failure] as usize;
-                }
-
-                failure = g[failure][ch] as usize;
-                f[g[state][ch] as usize] = failure as isize;
-
-                let failure_out = out.entry(failure).or_insert_with(|| vec![0; (k + BIT_WIDTH - 1) / BIT_WIDTH]).clone();
-                let state_out = out.entry(g[state][ch] as usize).or_insert_with(|| vec![0; (k + BIT_WIDTH - 1) / BIT_WIDTH]);
-
-                for word_idx in 0..(k + BIT_WIDTH - 1) / BIT_WIDTH {
-                    if word_idx >= state_out.len() || word_idx >= failure_out.len() {
-                        panic!("word_idx dizininin boyutunu aştı");
-                    }
-                    state_out[word_idx] |= failure_out[word_idx];
-                }
-
-                q.push_back(g[state][ch] as usize);
-            }
-        }
-    }
-}
-
-fn find_next_state(current_state: usize, next_input: char) -> usize {
-    let ch = *CHAR_TO_INDEX.get(&next_input).unwrap_or(&0);
-
-    let f = F.lock().unwrap();
-    let g = G.lock().unwrap();
-
-    let mut state = current_state;
-    while g[state][ch] == -1 {
-        if state == 0 {
-            break;  // Eğer state zaten 0 ise, daha fazla azaltma yapamayız.
-        }
-        state = f[state] as usize;
-    }
-    g[state][ch] as usize
-}
-
-fn search_words(arr: &[String], k: usize, file_path: &str, pb: &ProgressBar) -> io::Result<()> {
-    let text = read_all_bytes(file_path)?;
-    build_matching_machine(&arr, k);
-
-    let mut current_state = 0;
-
-    let out = OUT.lock().unwrap();
-
-    for (i, &byte) in text.iter().enumerate() {
-        let c = byte as char;
-        current_state = find_next_state(current_state, c);
-
-        if let Some(state_out) = out.get(&current_state) {
-            for word_idx in 0..(k + BIT_WIDTH - 1) / BIT_WIDTH {
-                if state_out[word_idx] == 0 {
-                    continue;
-                }
-
-                for j in 0..BIT_WIDTH {
-                    if state_out[word_idx] & (1 << j) != 0 {
-                        let keyword_idx = word_idx * BIT_WIDTH + j;
-                        if keyword_idx < k {
-                            let start_index = if i >= arr[keyword_idx].len() - 1 {
-                                i - arr[keyword_idx].len() + 1
-                            } else {
-                                0
-                            };
-                            println!(
-                                "Kelime '{}' {} ile {} arasında geçiyor",
-                                arr[keyword_idx],
-                                start_index,
-                                i
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    pb.inc(1); // Progress bar'ı artır
-
-    Ok(())
-}
-
-fn sub_dir_list_files(path: &str) -> io::Result<Vec<String>> {
+fn list_files(path: &str) -> Result<Vec<String>, Error> {
     let mut files = Vec::new();
-
-    let entries = fs::read_dir(path).map_err(|e| {
-        io::Error::new(io::ErrorKind::NotFound, format!("Dizin okunamadı: {}", e))
-    })?;
-
-    for entry in entries {
-        let entry = entry.map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("Giriş okunamadı: {}", e))
-        })?;
-        
-        if entry.file_type().map_err(|e| {
-            io::Error::new(io::ErrorKind::Other, format!("Dosya türü alınamadı: {}", e))
-        })?.is_file() {
-            let path = entry.path().display().to_string();
-            println!("{}", path);
-            files.push(path);
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file() {
+            files.push(path.display().to_string());
+        } else if path.is_dir() {
+            files.extend(list_files(&path.display().to_string())?);
         }
     }
-
-    println!(
-        "Toplam {} dosya bulundu\nOkuma Başarılı\n\n---------------------------------\n\n",
-        files.len()
-    );
-
     Ok(files)
 }
 
-fn main() -> io::Result<()> {
-    let mut csv_path = String::new();
-    println!("CSV dosyasının yolunu girin: ");
-    io::stdin().read_line(&mut csv_path)?;
-    let csv_path = csv_path.trim();
+fn get_nt_header_signature(file_path: &str) -> Result<String, Error> {
+    unsafe {
+        let file_name = CString::new(file_path).unwrap();
+        let file_handle = CreateFileA(
+            file_name.as_ptr(),
+            GENERIC_READ,
+            0,
+            null_mut(),
+            OPEN_EXISTING,
+            0,
+            null_mut(),
+        );
 
+        if file_handle == INVALID_HANDLE_VALUE {
+            return Err(Error::last_os_error());
+        }
+
+        let mapping_handle = CreateFileMappingW(
+            file_handle,
+            null_mut(),
+            PAGE_READONLY,
+            0,
+            0,
+            null_mut(),
+        );
+
+        if mapping_handle == null_mut() {
+            CloseHandle(file_handle);
+            return Err(Error::last_os_error());
+        }
+
+        let base_address = MapViewOfFile(
+            mapping_handle,
+            FILE_MAP_READ,
+            0,
+            0,
+            0,
+        );
+
+        if base_address == null_mut() {
+            CloseHandle(mapping_handle);
+            CloseHandle(file_handle);
+            return Err(Error::last_os_error());
+        }
+
+        let dos_header = &*(base_address as *const IMAGE_DOS_HEADER);
+        if dos_header.e_magic != IMAGE_DOS_SIGNATURE {
+            UnmapViewOfFile(base_address);
+            CloseHandle(mapping_handle);
+            CloseHandle(file_handle);
+            return Err(Error::from_raw_os_error(87)); // ERROR_INVALID_PARAMETER
+        }
+
+        let nt_headers = &*((base_address as *const u8).offset(dos_header.e_lfanew as isize) as *const IMAGE_NT_HEADERS64);
+        if nt_headers.Signature != IMAGE_NT_SIGNATURE {
+            UnmapViewOfFile(base_address);
+            CloseHandle(mapping_handle);
+            CloseHandle(file_handle);
+            return Err(Error::from_raw_os_error(87)); // ERROR_INVALID_PARAMETER
+        }
+
+        let file_header = &nt_headers.FileHeader;
+        let machine = file_header.Machine;
+        if machine != IMAGE_FILE_MACHINE_I386 && machine != IMAGE_FILE_MACHINE_AMD64 {
+            UnmapViewOfFile(base_address);
+            CloseHandle(mapping_handle);
+            CloseHandle(file_handle);
+            return Err(Error::from_raw_os_error(87)); // ERROR_INVALID_PARAMETER
+        }
+
+        let signature = nt_headers.Signature.to_le_bytes();
+        let nt_signature_str = signature.iter().map(|b| *b as char).collect();
+
+        UnmapViewOfFile(base_address);
+        CloseHandle(mapping_handle);
+        CloseHandle(file_handle);
+
+        Ok(nt_signature_str)
+    }
+}
+
+fn main() -> Result<(), Error> {
+    // Start the timer
+    let start_time = Instant::now();
+
+    println!("Enter the folder directory:");
     let mut dir_path = String::new();
-    println!("Klasörün yolunu girin: ");
-    io::stdin().read_line(&mut dir_path)?;
+    std::io::stdin().read_line(&mut dir_path)?;
     let dir_path = dir_path.trim();
 
-    let mut keywords = Vec::new();
-    let file = File::open(csv_path)?;
-    let reader = io::BufReader::new(file);
+    println!("Enter the directory of the CSV file:");
+   
+    let mut csv_path = String::new();
+    std::io::stdin().read_line(&mut csv_path)?;
+    let csv_path = csv_path.trim();
+    println!("\n\n");
+    let file_paths = list_files(dir_path)?;
+    let csv_data = read_all_bytes(csv_path)?;
 
-    for line in reader.lines() {
-        keywords.push(line?);
+    // Create a progress bar
+    let pb = ProgressBar::new(file_paths.len() as u64);
+    pb.set_style(ProgressStyle::default_bar()
+        .template("{msg} [{elapsed_precise}] [{bar:40}] {percent}%")
+        .progress_chars("#>-"));
+
+    for entry in file_paths {
+        let file_bytes = read_all_bytes(&entry)?;
+        if file_bytes.len() >= 2 && &file_bytes[0..2] == b"MZ" {
+            let nt_signature_result = get_nt_header_signature(&entry);
+            if let Ok(nt_signature) = nt_signature_result {
+                println!();
+                rk_search(&nt_signature, &csv_data, 7);
+                println!("{} \nNT header signature found (ASCII): {}", entry, nt_signature);
+                println!();
+            } else {
+                println!("{} is not a valid PE file.", entry);
+            }
+        } else {
+            println!("{} is not a valid PE file.", entry);
+        }
+
+        // Update the progress bar
+        pb.inc(1);
     }
 
-    let k = keywords.len();
+    // Finish the progress bar
+    pb.finish_with_message("Done");
 
-    let directories = sub_dir_list_files(dir_path)?;
-
-    let pb = ProgressBar::new(directories.len() as u64);
-
-    let start = Instant::now();
-
-    for entry in directories {
-        search_words(&keywords, k, &entry, &pb)?;
-    }
-
-    pb.finish_with_message("Tamamlandı!");
-
-    let duration = start.elapsed();
-    println!("Toplam süre: {:.2?} saniye", duration);
+    // Print elapsed time
+    println!("Elapsed time: {:?}", start_time.elapsed());
 
     Ok(())
 }
